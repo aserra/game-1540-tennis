@@ -3,6 +3,9 @@
 @tailwind utilities;
 
 @layer base {
-  html, body { @apply bg-navy-ink m-0; touch-action: manipulation; -webkit-text-size-adjust: 100%; }
+  html, body { @apply bg-navy-ink m-0; -webkit-text-size-adjust: 100%; }
+  /* The game never scrolls or zooms: 'none' (unlike 'manipulation') also blocks pinch-zoom,
+     which two-thumb play (stick + swing pad) otherwise triggers. */
+  html, body, #app { touch-action: none; overscroll-behavior: none; overflow: hidden; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
 }

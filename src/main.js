@@ -15,4 +15,13 @@ document.addEventListener(
   { passive: false }
 )
 
+// Safety net: if the page still ends up zoomed in, toggling the viewport meta makes iOS reset it.
+const viewportMeta = document.querySelector('meta[name="viewport"]')
+const viewportContent = viewportMeta?.getAttribute('content')
+window.visualViewport?.addEventListener('resize', () => {
+  if (!viewportMeta || window.visualViewport.scale <= 1.01) return
+  viewportMeta.setAttribute('content', viewportContent.replace('maximum-scale=1.0', 'maximum-scale=1.0001'))
+  requestAnimationFrame(() => viewportMeta.setAttribute('content', viewportContent))
+})
+
 createApp(App).mount('#app')
