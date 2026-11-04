@@ -1,5 +1,6 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { createGame, clamp, SWING_TIME } from '../game/core.js'
 import '@fontsource/bebas-neue/latin-400.css'
 
 // 8-bit tennis, Game Boy style: the court is taller than the screen and a camera
@@ -20,11 +21,6 @@ const L = 172 // court length in px
 const TOP = -90 // world y of the first row of the background
 const BOTTOM = L + 70
 const ZS = 150
-const G = 1.0
-const NET_H = 0.055
-const REACH_X = 0.42
-const REACH_Y = 0.14
-const SWING_TIME = 0.34
 const STREAK_KEY = 'tennis-best-streak'
 
 // UI strings: English by default, Catalan when the browser is set to it.
@@ -78,6 +74,36 @@ const C = {
 }
 
 const canvas = ref(null)
+const stage = ref(null)
+// Two renderers over the same simulation: the 2D canvas and the Three.js one (src/game/render3d.js).
+// Order of precedence: ?2d / ?3d in the URL, then the choice remembered in this browser, then DEFAULT_MODE.
+const MODE_KEY = 'tennis-render-mode'
+const DEFAULT_MODE = '3d'
+const readMode = () => {
+  const q = new URLSearchParams(window.location.search)
+  if (q.has('2d')) return '2d'
+  if (q.has('3d')) return '3d'
+  try {
+    const saved = localStorage.getItem(MODE_KEY)
+    if (saved === '2d' || saved === '3d') return saved
+  } catch {
+    // storage blocked: fall back to the default
+  }
+  return DEFAULT_MODE
+}
+const renderMode = readMode()
+const use3d = renderMode === '3d'
+// Switching reloads the page (the renderers are not hot-swappable), so it is only offered between matches.
+const switchMode = () => {
+  const next = use3d ? '2d' : '3d'
+  try {
+    localStorage.setItem(MODE_KEY, next)
+  } catch {
+    // the URL parameter below still carries the choice
+  }
+  window.location.search = `?${next}`
+}
+let r3d = null
 const phase = ref('title') // title | playing | over
 const won = ref(false)
 const streak = ref(0)
@@ -246,8 +272,8 @@ const drawPerson = (gMain, a, facing, bobbing) => {
   const sy = 0
   const front = facing === 'front'
   const run = a.moving && a.swing === 0
-  const frame = run ? (Math.floor(t * 9) % 2 ? 'a' : 'b') : 'idle'
-  const bob = (run && frame === 'a' ? -1 : 0) + (bobbing ? -Math.abs(Math.round(Math.sin(t * 14) * 3)) : 0)
+  const frame = run ? (Math.floor(game.t * 9) % 2 ? 'a' : 'b') : 'idle'
+  const bob = (run && frame === 'a' ? -1 : 0) + (bobbing ? -Math.abs(Math.round(Math.sin(game.t * 14) * 3)) : 0)
   const fy = sy + (bobbing ? bob : 0)
   rect(g, sx - 6, sy - 1, 12, 2, 'rgba(0,0,0,0.28)')
   drawGrid(g, LEGS[frame], sx - 4, fy - 6)
@@ -279,391 +305,28 @@ let raf = 0
 let last = 0
 let acc = 0
 let audio = null
-let t = 0
-let inputX = 0
-let inputY = 0
-let keyX = 0
-let keyY = 0
-let padX = 0 // right pad, live
-let padY = 0
 
-const ball = { tx: 0, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, lastHitter: 'p', bounced: false, bounces: 0, serve: false, sSide: 1, netDone: true, inHand: true }
-const mk = (y) => ({ x: 0, y, charge: 0, power: 0.3, aimX: 0, aimY: 0, swing: 0, hit: false, type: 'fh', moving: false, queued: false, react: 0 })
-const pl = mk(1.0)
-const cpu = mk(0.0)
-let mode = 'title' // title | serve | rally | point | over
-let server = 'c' // flipped at start: the player serves first
-let side = 1
-let faults = 0
-let timer = 0
-let msg = null
-let pts = { p: 0, c: 0 }
-let rally = 0
-let gameEnded = false
-let pointWinner = null
-
-const rand = (a, b) => a + Math.random() * (b - a)
-const clamp = (v, a, b) => Math.min(b, Math.max(a, v))
-
-const beep = (freq, ms, type = 'square') => {
-  if (!audio) return
-  const osc = audio.createOscillator()
-  const gain = audio.createGain()
-  osc.type = type
-  osc.frequency.value = freq
-  gain.gain.value = 0.04
-  osc.connect(gain).connect(audio.destination)
-  osc.start()
-  osc.stop(audio.currentTime + ms / 1000)
-}
-const syncScore = () => {
-  scoreP.value = label(pts.p, pts.c)
-  scoreC.value = label(pts.c, pts.p)
-}
-const say = (text) => {
-  msg = { text, t: 1.4 }
-}
-const label = (a, b) => {
-  if (a >= 4 && a - b >= 2) return 'WIN'
-  if (a >= 3 && b >= 3) return a === b ? '40' : a > b ? 'AD' : '40'
-  return ['0', '15', '30', '40'][Math.min(a, 3)]
-}
-
-const strike = (who, tx, ty, T, quality = 1, isServe = false) => {
-  const z0 = Math.max(ball.z, 0.05)
-  ball.z = z0
-  ball.lastHitter = who
-  ball.bounced = false
-  ball.bounces = 0
-  ball.netDone = false
-  ball.inHand = false
-  ball.serve = isServe
-  ball.tx = tx
-  ball.vx = (tx - ball.x) / T
-  ball.vy = (ty - ball.y) / T
-  ball.vz = (((G * T * T) / 2 - z0) / T) * rand(0.94, 1.06) * (1 - (1 - quality) * 0.22)
-  if (who === 'p') cpu.react = rand(0.12, 0.28)
-  beep(who === 'p' ? 520 : 440, 45)
-}
-const rallyTime = () => clamp(1.15 - 0.015 * rally, 0.85, 1.15)
-
-// Serve aim for the player: left/right of the stick inside the diagonal box.
-const liveAim = () => [clamp(padX + 0.5 * (inputX + keyX), -1, 1), clamp(padY, -1, 1)]
-const serveAim = () => {
-  const dir = pl.x >= 0 ? -1 : 1
-  const swinging = pl.swing > 0 || pl.queued
-  const [sx, sy] = swinging ? [pl.aimX, pl.aimY] : liveAim()
-  return [dir * (0.1 + 0.85 * (0.5 + 0.5 * sx * dir)), 0.37 + sy * 0.12]
-}
-
-const doServe = (who) => {
-  const s = who === 'p' ? pl : cpu
-  const sgn = s.x >= 0 ? 1 : -1
-  ball.x = s.x
-  ball.y = s.y
-  ball.z = 0.16
-  ball.sSide = sgn
-  rally = 0
-  mode = 'rally'
-  serveHint.value = false
-  if (who === 'p') {
-    const [ax, ay] = serveAim()
-    const pw = pl.power
-    const wild = Math.max(0, pw - 0.55) * 0.3
-    strike(who, ax + rand(-1, 1) * (0.06 + wild), ay + rand(-1, 1) * (0.04 + wild * 0.5), 1.2 * (1 - 0.22 * ((pw - 0.3) / 0.7)), 1, true)
-  } else {
-    const mag = 0.15 + rand(0, 0.75) + rand(-0.12, 0.12)
-    strike(who, -sgn * mag, 0.5 + rand(0.08, 0.26), 1.2, 1, true)
+const sound = {
+  init() {
+    if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)()
+  },
+  play(freq, ms, type) {
+    if (!audio) return
+    const osc = audio.createOscillator()
+    const gain = audio.createGain()
+    osc.type = type
+    osc.frequency.value = freq
+    gain.gain.value = 0.04
+    osc.connect(gain).connect(audio.destination)
+    osc.start()
+    osc.stop(audio.currentTime + ms / 1000)
   }
 }
-
-const startSwing = (a, type, power = 0.3, aim = [0, 0]) => {
-  if (a.swing > 0) return false
-  a.swing = 0.0001
-  a.hit = false
-  a.type = type
-  a.power = power
-  a.aimX = aim[0]
-  a.aimY = aim[1]
-  return true
-}
-
-const startPoint = () => {
-  mode = 'serve'
-  side = (pts.p + pts.c) % 2 === 0 ? 1 : -1
-  faults = 0
-  resetServe()
-}
-const resetServe = () => {
-  const s = server === 'p' ? pl : cpu
-  const r = server === 'p' ? cpu : pl
-  s.x = side * 0.5
-  s.y = server === 'p' ? 1.0 : 0.0
-  r.x = -side * 0.5
-  r.y = server === 'p' ? 0.04 : 0.96
-  s.swing = 0
-  s.queued = false
-  ball.inHand = true
-  ball.serve = false
-  timer = 1.0
-  serveHint.value = server === 'p'
-  pointWinner = null
-}
-
-const finishMatch = () => {
-  mode = 'over'
-  phase.value = 'over'
-  won.value = pts.p > pts.c
-  streak.value = won.value ? streak.value + 1 : 0
-  if (streak.value > bestStreak.value) {
-    bestStreak.value = streak.value
-    localStorage.setItem(STREAK_KEY, String(bestStreak.value))
-  }
-  beep(won.value ? 880 : 140, 400)
-}
-const endPoint = (winner, text) => {
-  if (mode !== 'rally') return
-  mode = 'point'
-  timer = 1.6
-  pts[winner]++
-  syncScore()
-  pointWinner = winner
-  say(text)
-  ball.vx = 0
-  ball.vy = 0
-  gameEnded = (pts.p >= 4 || pts.c >= 4) && Math.abs(pts.p - pts.c) >= 2
-  beep(winner === 'p' ? 784 : 196, 160)
-}
-const fault = (text) => {
-  faults++
-  if (faults >= 2) endPoint(server === 'p' ? 'c' : 'p', 'DBL FAULT')
-  else {
-    say(text)
-    mode = 'serve'
-    resetServe()
-    beep(150, 150)
-  }
-}
-const start = () => {
-  if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)()
-  pts = { p: 0, c: 0 }
-  syncScore()
-  server = server === 'p' ? 'c' : 'p'
-  gameEnded = false
-  phase.value = 'playing'
-  startPoint()
-}
-
-// ---- simulation -----------------------------------------------------------
-const stepBall = (dt) => {
-  const prevY = ball.y
-  ball.vz -= G * dt
-  ball.x += ball.vx * dt
-  ball.y += ball.vy * dt
-  ball.z += ball.vz * dt
-
-  if (!ball.netDone && (prevY - 0.5) * (ball.y - 0.5) < 0) {
-    ball.netDone = true
-    if (ball.z < NET_H) {
-      ball.vx = 0
-      ball.vy = 0
-      if (ball.serve && !ball.bounced) fault('NET!')
-      else endPoint(ball.lastHitter === 'p' ? 'c' : 'p', 'NET!')
-      return
-    }
-  }
-
-  if (ball.z <= 0 && ball.vz < 0) {
-    ball.z = 0
-    ball.bounces++
-    beep(190, 30, 'triangle')
-    if (!ball.bounced) {
-      const hitter = ball.lastHitter
-      let ok
-      if (ball.serve) {
-        const inX = Math.abs(ball.x) <= 1.02 && ball.x * ball.sSide <= 0.02
-        const inY = hitter === 'p' ? ball.y >= 0.23 && ball.y <= 0.5 : ball.y >= 0.5 && ball.y <= 0.77
-        ok = inX && inY
-      } else {
-        const inX = Math.abs(ball.x) <= 1.03
-        const inY = hitter === 'p' ? ball.y >= -0.02 && ball.y <= 0.5 : ball.y >= 0.5 && ball.y <= 1.02
-        ok = inX && inY
-      }
-      if (!ok) {
-        ball.vx = ball.vy = 0
-        if (ball.serve) fault('FAULT!')
-        else endPoint(hitter === 'p' ? 'c' : 'p', 'OUT!')
-        return
-      }
-      if (ball.serve) say('IN!')
-      ball.bounced = true
-    } else if (ball.bounces >= 2) {
-      endPoint(ball.lastHitter, '')
-      return
-    }
-    ball.vz = -ball.vz * 0.62
-    ball.vx *= 0.8
-    ball.vy *= 0.8
-  }
-  if (ball.y < -0.45 || ball.y > 1.45 || Math.abs(ball.x) > 2.3) endPoint(ball.lastHitter, '')
-}
-
-// Both players hit through the same rule. The reach follows the racket (the side of the
-// swing) as well as the body, so the racket connects where it visibly is. Timing also
-// matters: hitting the ball early (before it reaches your height) gives a harder, more
-// angled and deeper shot, but a riskier one; hitting it late gives a soft, short, safer one.
-const RACKET_OFF = 0.4
-const tryHit = (a, who) => {
-  const ph = a.swing / SWING_TIME
-  if (a.hit || ph < 0.2 || ph > 0.85) return
-  const incoming = who === 'p' ? ball.lastHitter === 'c' : ball.lastHitter === 'p'
-  if (!incoming || ball.z > 0.36) return
-  // Volley: the player may hit the ball before it bounces once it has crossed the net
-  // (never a serve, which must bounce). Otherwise the ball must have bounced exactly once.
-  const volley = who === 'p' && ball.netDone && !ball.serve && !ball.bounced
-  if (!volley && (!ball.bounced || ball.bounces !== 1)) return
-  const dy = ball.y - a.y
-  const side = (who === 'c' ? -1 : 1) * (a.type === 'bh' ? -1 : 1)
-  const dBody = Math.hypot((ball.x - a.x) / REACH_X, dy / REACH_Y) * 1.15
-  const dRacket = Math.hypot((ball.x - (a.x + side * RACKET_OFF)) / REACH_X, dy / REACH_Y)
-  const d = Math.min(dBody, dRacket)
-  if (d >= 1) return
-  const q = 1 - d
-  // e > 0: early (ball still ahead of the player), e < 0: late (already level or past)
-  const lead = who === 'p' ? -dy : dy
-  const e = clamp(lead / REACH_Y, -1, 1)
-  const early = Math.max(e, 0)
-  const late = Math.max(-e, 0)
-  a.hit = true
-  rally++
-  const pw = who === 'p' ? a.power : 0.3
-  const boost = (pw - 0.3) / 0.7 // 0 = plain tap, 1 = fully charged
-  const sloppy = (1 - q) * 0.3 + early * 0.1 + Math.max(0, pw - 0.55) * 0.35 * (1.2 - q)
-  let tx
-  let ty
-  let T = rallyTime() * (1 + (1 - q) * 0.12) * (1 - 0.22 * early + 0.25 * late) * (1 - 0.3 * boost)
-  let shot = 'normal'
-  if (who === 'p') {
-    const stick = a.aimX
-    // Lob / drop only when the drag is clearly vertical (within ~35° of the vertical axis):
-    // a thumb pushed fully sideways always drifts a bit up or down and must stay a normal shot.
-    const vertical = Math.abs(a.aimY) > 0.4 && Math.abs(a.aimY) > 1.5 * Math.abs(a.aimX)
-    if (vertical) shot = a.aimY < 0 ? 'lob' : 'drop'
-    tx = clamp(stick * 0.9 * (1 + 0.45 * early - 0.35 * late + 0.2 * boost) + ((ball.x - a.x) / REACH_X) * 0.1, -1, 1)
-    tx += rand(-1, 1) * (0.02 + sloppy + 0.002 * rally)
-    ty = 0.06 + (1 - q) * 0.2 + rand(0, 0.06) - early * 0.04 + late * 0.12 - boost * 0.05
-    if (volley && shot === 'normal') T *= 0.85 // a volley is punchier: the opponent has less time
-    if (shot === 'lob') {
-      // high and slow, deep: buys time
-      ty = 0.04 + rand(0, 0.06) + (1 - q) * 0.1
-      T = 1.65
-    } else if (shot === 'drop') {
-      // soft and short, just over the net
-      tx *= 0.6
-      ty = 0.37 + rand(0, 0.05) + (1 - q) * 0.08
-      T = 1.15
-    }
-  } else {
-    const away = pl.x > 0 ? -1 : 1
-    tx = (Math.random() < 0.8 ? away * rand(0.35, 0.92) : rand(-0.9, 0.9)) + rand(-1, 1) * (0.06 + sloppy + 0.01 * rally)
-    ty = rand(0.78, 0.92) + rand(-1, 1) * sloppy * 0.5
-  }
-  strike(who, tx, Math.max(ty, who === 'p' ? 0.0 : ty), T, q)
-  if (who === 'p' && shot === 'lob' && q > 0.5) say('LOB!')
-  else if (who === 'p' && shot === 'drop' && q > 0.5) say('DROP!')
-  else if (who === 'p' && boost > 0.8 && q > 0.65) say('POW!')
-  else if (who === 'p' && q > 0.8 && early > 0.4) say('NICE!')
-}
-
-const update = (dt) => {
-  t += dt
-  if (msg) {
-    msg.t -= dt
-    if (msg.t <= 0) msg = null
-  }
-  for (const a of [pl, cpu]) {
-    if (a.swing > 0) {
-      a.swing += dt
-      if (a.swing >= SWING_TIME) {
-        a.swing = 0
-        a.hit = false
-      }
-    }
-  }
-
-  // spring button: the charge follows the pull (or the time held)
-  if (charging && (phase.value !== 'playing' || (mode !== 'serve' && mode !== 'rally'))) charging = false
-  pl.charge = charging ? chargeValue() : 0
-  chargeUi.value = pl.charge
-
-  // player: free movement
-  const mx = clamp(inputX + keyX, -1, 1)
-  const my = clamp(inputY + keyY, -1, 1)
-  const canMove = mode !== 'point' || true
-  pl.moving = canMove && (Math.abs(mx) > 0.08 || Math.abs(my) > 0.08) && mode !== 'title'
-  if (pl.moving && mode !== 'over') {
-    const yMin = mode === 'serve' && server === 'p' ? 1.0 : 0.56
-    const yMax = mode === 'serve' && server === 'p' ? 1.0 : 1.12
-    pl.x = clamp(pl.x + mx * 1.5 * dt, -1.1, 1.1)
-    pl.y = clamp(pl.y + my * 0.45 * dt, yMin, yMax)
-  }
-
-  if (mode === 'serve') {
-    const s = server === 'p' ? pl : cpu
-    cpu.moving = false
-    ball.x = s.x + 0.03
-    ball.y = s.y
-    ball.z = s.swing > 0 ? 0.1 + 0.25 * Math.min(1, s.swing / (SWING_TIME * 0.45)) : 0.1
-    if (server === 'c') {
-      timer -= dt
-      if (timer <= 0 && s.swing === 0 && !s.queued) {
-        s.queued = true
-        startSwing(s, 'fh')
-      }
-    }
-    if (s.queued && s.swing / SWING_TIME >= 0.45) {
-      s.queued = false
-      doServe(server)
-    }
-    return
-  }
-
-  if (mode === 'point') {
-    timer -= dt
-    if (timer <= 0) {
-      if (gameEnded) finishMatch()
-      else startPoint()
-    }
-    return
-  }
-  if (mode !== 'rally') return
-
-  stepBall(dt)
-  if (mode !== 'rally') return
-
-  tryHit(pl, 'p')
-
-  // cpu: reacts after a delay, then chases the ball and swings when it is close
-  if (ball.lastHitter === 'p') {
-    cpu.react -= dt
-    if (cpu.react <= 0) {
-      const goal = ball.bounced ? ball.x : ball.x + ball.vx * 0.2
-      const dx = goal - cpu.x
-      cpu.moving = Math.abs(dx) > 0.03 && cpu.swing === 0
-      cpu.x += clamp(dx, -1.05 * dt, 1.05 * dt)
-      const gy = ball.bounced ? clamp(ball.y, -0.12, 0.44) : 0.02
-      cpu.y += clamp(gy - cpu.y, -0.4 * dt, 0.4 * dt)
-    }
-    if (ball.bounced && ball.vy < 0 && cpu.swing === 0 && Math.abs(ball.y - cpu.y) < 0.14 && Math.abs(ball.x - cpu.x) < 0.55) {
-      startSwing(cpu, ball.x < cpu.x ? 'bh' : 'fh')
-    }
-  } else {
-    cpu.moving = false
-    cpu.x += clamp(0 - cpu.x, -0.4 * dt, 0.4 * dt)
-    cpu.y += clamp(0.0 - cpu.y, -0.2 * dt, 0.2 * dt)
-  }
-  tryHit(cpu, 'c')
-}
+const game = createGame({
+  ui: { phase, won, streak, bestStreak, serveHint, scoreP, scoreC, chargeUi, persistBest: (n) => localStorage.setItem(STREAK_KEY, String(n)) },
+  sound
+})
+const { ball, pl, cpu, input } = game
 
 // ---- drawing --------------------------------------------------------------
 const drawBall = (g) => {
@@ -687,8 +350,8 @@ const drawNet = (g) => {
 }
 
 const drawAim = (g) => {
-  if (Math.floor(t * 5) % 2) return
-  const [tx, ty] = serveAim()
+  if (Math.floor(game.t * 5) % 2) return
+  const [tx, ty] = game.serveAim()
   const [x, y] = screen(tx, ty)
   rect(g, x - 4, y - 1, 9, 2, C.yellow)
   rect(g, x - 1, y - 4, 2, 9, C.yellow)
@@ -696,20 +359,20 @@ const drawAim = (g) => {
 
 // Referee's speech bubble (the score lives in the page header).
 const drawHud = (g) => {
-  if (msg && msg.text) {
-    const w = textWidth(msg.text, 2) + 8
+  if (game.msg && game.msg.text) {
+    const w = textWidth(game.msg.text, 2) + 8
     const x = W - w - 4
     rect(g, x, 40, w, 16, C.line)
     rect(g, x + 1, 41, w - 2, 14, '#FFFFFF')
     rect(g, x + w - 12, 56, 4, 3, C.line)
-    drawText(g, msg.text, x + 4, 44, 2, C.dark)
+    drawText(g, game.msg.text, x + 4, 44, 2, C.dark)
   }
 }
 
 // The court is short enough for both players to stay on screen; the camera only
 // leans a little towards where the ball is.
 const updateCamera = (dt) => {
-  const focus = mode === 'rally' ? ball.y : pl.y
+  const focus = game.mode === 'rally' ? ball.y : pl.y
   const target = -53 + (clamp(focus, 0, 1) - 0.5) * 8
   camY += (target - camY) * Math.min(1, dt * 5)
 }
@@ -717,14 +380,14 @@ const updateCamera = (dt) => {
 const draw = () => {
   const g = ctx
   g.drawImage(bg, 0, Math.round(TOP - camY))
-  const showBall = mode !== 'title'
+  const showBall = game.mode !== 'title'
   const ballFar = ball.y < 0.5
-  drawPerson(g, cpu, 'front', mode === 'point' && pointWinner === 'c')
+  drawPerson(g, cpu, 'front', game.mode === 'point' && game.pointWinner === 'c')
   if (showBall && ballFar) drawBall(g)
   drawNet(g)
   if (showBall && !ballFar) drawBall(g)
-  if (mode === 'serve' && server === 'p') drawAim(g)
-  drawPerson(g, pl, 'back', mode === 'point' && pointWinner === 'p')
+  if (game.mode === 'serve' && game.server === 'p') drawAim(g)
+  drawPerson(g, pl, 'back', game.mode === 'point' && game.pointWinner === 'p')
   drawHud(g)
 }
 
@@ -733,48 +396,22 @@ const loop = (now) => {
   last = now
   acc += dt
   while (acc >= 1 / 120) {
-    update(1 / 120)
+    game.update(1 / 120)
     acc -= 1 / 120
   }
-  updateCamera(dt)
-  draw()
+  if (r3d) {
+    r3d.render(dt)
+  } else {
+    updateCamera(dt)
+    draw()
+  }
   raf = requestAnimationFrame(loop)
 }
 
-// ---- input ----------------------------------------------------------------
-const swing = (power = 0.3) => {
-  if (phase.value !== 'playing') return start()
-  if (mode === 'serve' && server === 'p') {
-    if (pl.swing === 0 && !pl.queued) {
-      pl.queued = true
-      startSwing(pl, 'fh', power, liveAim())
-    }
-  } else if (mode === 'rally') {
-    startSwing(pl, ball.x < pl.x - 0.05 ? 'bh' : 'fh', power, liveAim())
-  }
-}
-
-// Spring button: pull it down (or hold it) to charge, release to swing. A quick tap is a plain shot.
-let charging = false
-let chargeT0 = 0
 let padAnchor = [0, 0]
 const PAD_PX = 40
-const chargeValue = () => clamp((performance.now() - chargeT0) / 900, 0, 1)
-const beginCharge = () => {
-  if (phase.value !== 'playing') return start()
-  if (mode !== 'serve' && mode !== 'rally') return
-  charging = true
-  chargeT0 = performance.now()
-}
-const releaseCharge = () => {
-  if (!charging) return
-  const power = clamp(0.3 + chargeValue() * 0.7, 0.3, 1)
-  charging = false
-  pl.charge = 0
-  swing(power) // reads the pad while it is still held
-}
 const resetPad = () => {
-  padX = padY = 0
+  input.padX = input.padY = 0
   padKnob.value = { x: 0, y: 0 }
 }
 const onPadDown = (e) => {
@@ -784,16 +421,16 @@ const onPadDown = (e) => {
     // not an active pointer (synthetic event): the pad still works without capture
   }
   padAnchor = [e.clientX, e.clientY]
-  beginCharge()
+  game.beginCharge()
 }
 const onPadMove = (e) => {
-  if (!charging) return
-  padX = clamp((e.clientX - padAnchor[0]) / PAD_PX, -1, 1)
-  padY = clamp((e.clientY - padAnchor[1]) / PAD_PX, -1, 1)
-  padKnob.value = { x: padX * 26, y: padY * 26 }
+  if (!game.charging) return
+  input.padX = clamp((e.clientX - padAnchor[0]) / PAD_PX, -1, 1)
+  input.padY = clamp((e.clientY - padAnchor[1]) / PAD_PX, -1, 1)
+  padKnob.value = { x: input.padX * 26, y: input.padY * 26 }
 }
 const onPadUp = () => {
-  releaseCharge()
+  game.releaseCharge()
   resetPad()
 }
 
@@ -810,8 +447,8 @@ const moveStick = (e) => {
     dx = (dx / len) * max
     dy = (dy / len) * max
   }
-  inputX = clamp(dx / max, -1, 1)
-  inputY = clamp(dy / max, -1, 1)
+  input.x = clamp(dx / max, -1, 1)
+  input.y = clamp(dy / max, -1, 1)
   knob.value = { x: dx, y: dy }
 }
 const onStickDown = (e) => {
@@ -825,21 +462,21 @@ const onStickMove = (e) => {
 const onStickUp = (e) => {
   if (e.pointerId !== stickId) return
   stickId = null
-  inputX = inputY = 0
+  input.x = input.y = 0
   knob.value = { x: 0, y: 0 }
 }
 
 const onKey = (e) => {
   const down = e.type === 'keydown'
   const set = (v, key, cur) => (down ? v : cur === v ? 0 : cur)
-  if (e.key === 'ArrowLeft') keyX = set(-1, e.key, keyX)
-  else if (e.key === 'ArrowRight') keyX = set(1, e.key, keyX)
-  else if (e.key === 'ArrowUp') keyY = set(-1, e.key, keyY)
-  else if (e.key === 'ArrowDown') keyY = set(1, e.key, keyY)
+  if (e.key === 'ArrowLeft') input.keyX = set(-1, e.key, input.keyX)
+  else if (e.key === 'ArrowRight') input.keyX = set(1, e.key, input.keyX)
+  else if (e.key === 'ArrowUp') input.keyY = set(-1, e.key, input.keyY)
+  else if (e.key === 'ArrowDown') input.keyY = set(1, e.key, input.keyY)
   else if (e.key === ' ' || e.key === 'z') {
-    if (down && !e.repeat) beginCharge()
-    else if (!down) releaseCharge()
-  } else if (down && !e.repeat && e.key === 'Enter') swing()
+    if (down && !e.repeat) game.beginCharge()
+    else if (!down) game.releaseCharge()
+  } else if (down && !e.repeat && e.key === 'Enter') game.swing()
 }
 
 onMounted(() => {
@@ -856,10 +493,17 @@ onMounted(() => {
   camY = -53
   window.addEventListener('keydown', onKey)
   window.addEventListener('keyup', onKey)
+  if (use3d) {
+    // loaded on demand so the 2D game does not carry Three.js
+    import('../game/render3d.js').then(({ createRenderer3D }) => {
+      r3d = createRenderer3D({ container: stage.value, game, aspect: W / H, onTap: () => game.swing() })
+    })
+  }
   raf = requestAnimationFrame(loop)
 })
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf)
+  r3d?.dispose()
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('keyup', onKey)
   audio?.close()
@@ -867,9 +511,23 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="min-h-[100dvh] bg-navy-ink flex flex-col items-center px-4 py-3 select-none">
-    <div class="w-full max-w-[420px] flex items-center justify-between text-cream">
-      <span />
+  <div
+    class="bg-navy-ink select-none"
+    :class="use3d ? 'relative h-[100dvh] max-w-[480px] mx-auto overflow-hidden' : 'min-h-[100dvh] flex flex-col items-center px-4 py-3'"
+  >
+    <div
+      class="flex items-center justify-between text-cream"
+      :class="use3d ? 'absolute top-0 inset-x-0 z-10 px-4 pt-[max(0.75rem,env(safe-area-inset-top))] [text-shadow:0_2px_6px_rgba(0,0,0,0.55)]' : 'w-full max-w-[420px]'"
+    >
+      <button
+        v-if="phase !== 'playing'"
+        type="button"
+        class="min-h-8 min-w-12 rounded border-2 border-cream/50 px-2 font-['Bebas_Neue'] text-xl leading-none tracking-wide text-cream/90 hover:text-white"
+        @click="switchMode"
+      >
+        {{ use3d ? '2D' : '3D' }}
+      </button>
+      <span v-else class="min-w-12" />
       <div class="font-['Bebas_Neue'] text-2xl leading-none tracking-wide text-cream">
         COM <span class="text-ball-yellow">{{ scoreC }}</span>
         <span class="ml-3">YOU <span class="text-ball-yellow">{{ scoreP }}</span></span>
@@ -880,18 +538,24 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div class="relative" style="width: min(100%, calc((100dvh - 4.5rem - 8.5rem) * 144 / 240), 420px)">
+    <div
+      ref="stage"
+      :class="use3d ? 'absolute inset-0' : 'relative'"
+      :style="use3d ? null : 'width: min(100%, calc((100dvh - 4.5rem - 8.5rem) * 144 / 240), 420px)'"
+    >
       <canvas
+        v-show="!use3d"
         ref="canvas"
         :width="W"
         :height="H"
         class="w-full h-auto block rounded border-2 border-cream/80"
         style="image-rendering: pixelated; touch-action: none"
-        @pointerdown="swing()"
+        @pointerdown="game.swing()"
       />
       <div
         v-if="phase !== 'playing'"
-        class="absolute inset-0 flex flex-col items-center justify-center gap-2 pointer-events-none text-center text-cream bg-navy-ink/60 rounded"
+        class="absolute inset-0 flex flex-col items-center gap-2 pointer-events-none text-center text-cream bg-navy-ink/60 rounded"
+        :class="use3d ? 'justify-start pt-[24%]' : 'justify-center'"
       >
         <p class="font-['Bebas_Neue'] text-5xl text-ball-yellow">
           {{ phase === 'over' ? (won ? tr('win') : tr('lose')) : tr('title') }}
@@ -903,13 +567,18 @@ onBeforeUnmount(() => {
       </div>
       <p
         v-if="serveHint && phase === 'playing'"
-        class="absolute bottom-2 inset-x-0 text-center text-caption font-bold text-ball-yellow animate-pulse pointer-events-none"
+        class="absolute inset-x-0 text-center text-caption font-bold text-ball-yellow animate-pulse pointer-events-none"
+        :class="use3d ? 'bottom-[30%] [text-shadow:0_2px_6px_rgba(0,0,0,0.6)]' : 'bottom-2'"
       >
         {{ tr('serveHint2') }}
       </p>
     </div>
 
-    <div class="w-full max-w-[420px] mt-3 flex items-center justify-between px-2" style="touch-action: none">
+    <div
+      class="flex items-center justify-between"
+      :class="use3d ? 'absolute bottom-0 inset-x-0 z-10 px-4 pb-[max(1.25rem,env(safe-area-inset-bottom))]' : 'w-full max-w-[420px] mt-3 px-2'"
+      style="touch-action: none"
+    >
       <div
         ref="stickEl"
         class="relative h-28 w-28 rounded-full bg-cream/10 border-2 border-cream/40"
