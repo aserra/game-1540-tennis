@@ -15,6 +15,20 @@ document.addEventListener(
   { passive: false }
 )
 
+// Double-tap zoom: iOS ignores touch-action for it in some browsers, so swallow the second
+// quick touchend ourselves (pointer events already fired, so the controls are unaffected).
+let lastTouchEnd = 0
+document.addEventListener(
+  'touchend',
+  (e) => {
+    const now = Date.now()
+    if (now - lastTouchEnd < 350) e.preventDefault()
+    lastTouchEnd = now
+  },
+  { passive: false }
+)
+document.addEventListener('dblclick', (e) => e.preventDefault())
+
 // Safety net: if the page still ends up zoomed in, toggling the viewport meta makes iOS reset it.
 const viewportMeta = document.querySelector('meta[name="viewport"]')
 const viewportContent = viewportMeta?.getAttribute('content')
