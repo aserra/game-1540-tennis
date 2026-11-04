@@ -517,7 +517,11 @@ const tryHit = (a, who) => {
   const ph = a.swing / SWING_TIME
   if (a.hit || ph < 0.2 || ph > 0.85) return
   const incoming = who === 'p' ? ball.lastHitter === 'c' : ball.lastHitter === 'p'
-  if (!incoming || !ball.bounced || ball.bounces !== 1 || ball.z > 0.36) return
+  if (!incoming || ball.z > 0.36) return
+  // Volley: the player may hit the ball before it bounces once it has crossed the net
+  // (never a serve, which must bounce). Otherwise the ball must have bounced exactly once.
+  const volley = who === 'p' && ball.netDone && !ball.serve && !ball.bounced
+  if (!volley && (!ball.bounced || ball.bounces !== 1)) return
   const dy = ball.y - a.y
   const side = (who === 'c' ? -1 : 1) * (a.type === 'bh' ? -1 : 1)
   const dBody = Math.hypot((ball.x - a.x) / REACH_X, dy / REACH_Y) * 1.15
@@ -541,11 +545,14 @@ const tryHit = (a, who) => {
   let shot = 'normal'
   if (who === 'p') {
     const stick = a.aimX
-    if (a.aimY < -0.4) shot = 'lob'
-    else if (a.aimY > 0.4) shot = 'drop'
+    // Lob / drop only when the drag is clearly vertical (within ~35° of the vertical axis):
+    // a thumb pushed fully sideways always drifts a bit up or down and must stay a normal shot.
+    const vertical = Math.abs(a.aimY) > 0.4 && Math.abs(a.aimY) > 1.5 * Math.abs(a.aimX)
+    if (vertical) shot = a.aimY < 0 ? 'lob' : 'drop'
     tx = clamp(stick * 0.9 * (1 + 0.45 * early - 0.35 * late + 0.2 * boost) + ((ball.x - a.x) / REACH_X) * 0.1, -1, 1)
     tx += rand(-1, 1) * (0.02 + sloppy + 0.002 * rally)
     ty = 0.06 + (1 - q) * 0.2 + rand(0, 0.06) - early * 0.04 + late * 0.12 - boost * 0.05
+    if (volley && shot === 'normal') T *= 0.85 // a volley is punchier: the opponent has less time
     if (shot === 'lob') {
       // high and slow, deep: buys time
       ty = 0.04 + rand(0, 0.06) + (1 - q) * 0.1
